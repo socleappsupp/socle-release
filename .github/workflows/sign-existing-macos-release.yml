@@ -1,0 +1,226 @@
+name: Sign existing macOS release assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag, for example v2.0.20"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sign-existing-macos-assets:
+    runs-on: macos-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: macos-arm64
+            asset_name: Socle-macos-arm64.zip
+          - rid: macos-x64
+            asset_name: Socle-macos-x64.zip
+
+    steps:
+      - name: Import Apple Developer ID certificate
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: temporary-build-keychain-password
+        run: |
+          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > developer_id_application.p12
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+
+          security import developer_id_application.p12 \
+            -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            build.keychain
+
+          security find-identity -v -p codesigning
+
+      - name: Download existing release asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p input
+          gh release download "${{ github.event.inputs.tag }}" \
+            --pattern "${{ matrix.asset_name }}" \
+            --dir input
+
+          ls -la input
+
+      - name: Extract release asset
+        run: |
+          mkdir -p extracted
+          unzip -q "input/${{ matrix.asset_name }}" -d extracted
+          find extracted -maxdepth 3 -type f | sort | head -100
+
+      - name: Build Socle.app bundle from extracted binaries
+        run: |
+          rm -rf Socle.app
+          mkdir -p Socle.app/Contents/MacOS
+          mkdir -p Socle.app/Contents/Resources
+
+          # Pokud ZIP už obsahuje Socle.app, použijeme ho.
+          EXISTING_APP=$(find extracted -maxdepth 3 -name "Socle.app" -type d | head -n 1 || true)
+
+          if [ -n "$EXISTING_APP" ]; then
+            echo "Existing Socle.app found: $EXISTING_APP"
+            cp -R "$EXISTING_APP" ./Socle.app
+          else
+            echo "No Socle.app found. Creating app bundle from raw publish folder."
+
+            # Najdeme složku, kde leží hlavní executable Socle.
+            SOCLE_EXEC=$(find extracted -type f -name "Socle" | head -n 1 || true)
+
+            if [ -z "$SOCLE_EXEC" ]; then
+              echo "Could not find Socle executable."
+              echo "Extracted files:"
+              find extracted -maxdepth 5 -type f | sort
+              exit 1
+            fi
+
+            SOCLE_DIR=$(dirname "$SOCLE_EXEC")
+            echo "Using Socle publish directory: $SOCLE_DIR"
+
+            cp -R "$SOCLE_DIR"/* Socle.app/Contents/MacOS/
+          fi
+
+          chmod +x Socle.app/Contents/MacOS/Socle
+
+          cat > Socle.app/Contents/Info.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+          "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>Socle</string>
+            <key>CFBundleDisplayName</key>
+            <string>Socle</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.socleappsupp.socle</string>
+            <key>CFBundleVersion</key>
+            <string>${{ github.event.inputs.tag }}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${{ github.event.inputs.tag }}</string>
+            <key>CFBundleExecutable</key>
+            <string>Socle</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>12.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          echo "Created app bundle:"
+          find Socle.app -maxdepth 4 -type f | sort | head -100
+
+      - name: Create entitlements
+        run: |
+          cat > entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+          "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.cs.allow-jit</key>
+            <true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+            <true/>
+            <key>com.apple.security.cs.disable-library-validation</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Sign Socle.app
+        run: |
+          SIGN_IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -n 1 | sed -E 's/.*"(.+)"/\1/')
+
+          if [ -z "$SIGN_IDENTITY" ]; then
+            echo "Developer ID Application signing identity not found."
+            security find-identity -v -p codesigning
+            exit 1
+          fi
+
+          echo "Using signing identity: $SIGN_IDENTITY"
+
+          # Podepíšeme podepsatelné Mach-O soubory uvnitř app bundle.
+          while IFS= read -r -d '' file; do
+            if file "$file" | grep -q "Mach-O"; then
+              echo "Signing Mach-O file: $file"
+              codesign \
+                --force \
+                --timestamp \
+                --options runtime \
+                --entitlements entitlements.plist \
+                --sign "$SIGN_IDENTITY" \
+                "$file"
+            fi
+          done < <(find Socle.app/Contents/MacOS -type f -print0)
+
+          # Podepíšeme celý app bundle.
+          codesign \
+            --force \
+            --deep \
+            --timestamp \
+            --options runtime \
+            --entitlements entitlements.plist \
+            --sign "$SIGN_IDENTITY" \
+            Socle.app
+
+          codesign --verify --deep --strict --verbose=2 Socle.app
+
+      - name: Create ZIP for notarization
+        run: |
+          rm -f notarization-${{ matrix.asset_name }}
+          ditto -c -k --keepParent Socle.app notarization-${{ matrix.asset_name }}
+
+      - name: Notarize ZIP
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          xcrun notarytool submit notarization-${{ matrix.asset_name }} \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+
+      - name: Staple notarization ticket
+        run: |
+          xcrun stapler staple Socle.app
+          xcrun stapler validate Socle.app
+          spctl --assess --type execute --verbose Socle.app
+
+      - name: Create final signed ZIP
+        run: |
+          rm -f "${{ matrix.asset_name }}"
+          ditto -c -k --keepParent Socle.app "${{ matrix.asset_name }}"
+
+          shasum -a 256 "${{ matrix.asset_name }}"
+
+      - name: Upload signed ZIP to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.inputs.tag }}" "${{ matrix.asset_name }}" --clobber
