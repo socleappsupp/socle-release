@@ -104,6 +104,11 @@ jobs:
 
           chmod +x Socle.app/Contents/MacOS/Socle
 
+          find Socle.app/Contents/MacOS -maxdepth 1 -type f \( -iname "README.txt" -o -iname "README.md" -o -iname "VERSION.txt" \) -print0 | while IFS= read -r -d '' file; do
+            echo "Moving non-code file to Resources: $file"
+            mv "$file" Socle.app/Contents/Resources/
+          done
+
           cat > Socle.app/Contents/Info.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
