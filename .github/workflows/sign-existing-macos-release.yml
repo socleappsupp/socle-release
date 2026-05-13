@@ -60,18 +60,24 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p input
+
           gh release download "${{ github.event.inputs.tag }}" \
             --repo "${{ github.repository }}" \
             --pattern "${{ matrix.asset_name }}" \
             --dir input
 
+          echo "Downloaded input files:"
           ls -la input
 
       - name: Extract release asset
         run: |
+          rm -rf extracted
           mkdir -p extracted
+
           unzip -q "input/${{ matrix.asset_name }}" -d extracted
-          find extracted -maxdepth 3 -type f | sort | head -100
+
+          echo "Extracted files:"
+          find extracted -maxdepth 5 -type f | sort | head -200
 
       - name: Build Socle.app bundle from extracted binaries
         run: |
@@ -79,7 +85,7 @@ jobs:
           mkdir -p Socle.app/Contents/MacOS
           mkdir -p Socle.app/Contents/Resources
 
-          EXISTING_APP=$(find extracted -maxdepth 3 -name "Socle.app" -type d | head -n 1 || true)
+          EXISTING_APP=$(find extracted -maxdepth 5 -name "Socle.app" -type d | head -n 1 || true)
 
           if [ -n "$EXISTING_APP" ]; then
             echo "Existing Socle.app found: $EXISTING_APP"
@@ -92,7 +98,7 @@ jobs:
             if [ -z "$SOCLE_EXEC" ]; then
               echo "Could not find Socle executable."
               echo "Extracted files:"
-              find extracted -maxdepth 5 -type f | sort
+              find extracted -maxdepth 8 -type f | sort
               exit 1
             fi
 
@@ -102,12 +108,26 @@ jobs:
             cp -R "$SOCLE_DIR"/* Socle.app/Contents/MacOS/
           fi
 
+          if [ ! -f "Socle.app/Contents/MacOS/Socle" ]; then
+            echo "Socle executable was not found in Socle.app/Contents/MacOS."
+            echo "Current app bundle files:"
+            find Socle.app -maxdepth 6 -type f | sort
+            exit 1
+          fi
+
           chmod +x Socle.app/Contents/MacOS/Socle
 
-          find Socle.app/Contents/MacOS -maxdepth 1 -type f \( -iname "README.txt" -o -iname "README.md" -o -iname "VERSION.txt" \) -print0 | while IFS= read -r -d '' file; do
+          find Socle.app/Contents/MacOS -maxdepth 1 -type f \( \
+            -iname "README.txt" -o \
+            -iname "README.md" -o \
+            -iname "VERSION.txt" \
+          \) -print0 | while IFS= read -r -d '' file; do
             echo "Moving non-code file to Resources: $file"
             mv "$file" Socle.app/Contents/Resources/
           done
+
+          VERSION="${{ github.event.inputs.tag }}"
+          VERSION="${VERSION#v}"
 
           cat > Socle.app/Contents/Info.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -122,9 +142,9 @@ jobs:
             <key>CFBundleIdentifier</key>
             <string>com.socleappsupp.socle</string>
             <key>CFBundleVersion</key>
-            <string>${{ github.event.inputs.tag }}</string>
+            <string>$VERSION</string>
             <key>CFBundleShortVersionString</key>
-            <string>${{ github.event.inputs.tag }}</string>
+            <string>$VERSION</string>
             <key>CFBundleExecutable</key>
             <string>Socle</string>
             <key>CFBundlePackageType</key>
@@ -138,7 +158,7 @@ jobs:
           EOF
 
           echo "Created app bundle:"
-          find Socle.app -maxdepth 4 -type f | sort | head -100
+          find Socle.app -maxdepth 5 -type f | sort | head -200
 
       - name: Create entitlements
         run: |
@@ -185,7 +205,6 @@ jobs:
 
           codesign \
             --force \
-            --deep \
             --timestamp \
             --options runtime \
             --entitlements entitlements.plist \
@@ -196,8 +215,12 @@ jobs:
 
       - name: Create ZIP for notarization
         run: |
-          rm -f notarization-${{ matrix.asset_name }}
-          ditto -c -k --keepParent Socle.app notarization-${{ matrix.asset_name }}
+          rm -f "notarization-${{ matrix.asset_name }}"
+          ditto -c -k --keepParent Socle.app "notarization-${{ matrix.asset_name }}"
+
+          echo "Notarization ZIP:"
+          ls -lh "notarization-${{ matrix.asset_name }}"
+          shasum -a 256 "notarization-${{ matrix.asset_name }}"
 
       - name: Notarize ZIP
         env:
@@ -205,11 +228,74 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
-          xcrun notarytool submit notarization-${{ matrix.asset_name }} \
+          set -euo pipefail
+
+          ZIP_PATH="notarization-${{ matrix.asset_name }}"
+
+          echo "Submitting notarization request for $ZIP_PATH"
+
+          SUBMISSION_OUTPUT=$(xcrun notarytool submit "$ZIP_PATH" \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --wait
+            --output-format json)
+
+          echo "$SUBMISSION_OUTPUT"
+
+          SUBMISSION_ID=$(echo "$SUBMISSION_OUTPUT" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+          echo "Notarization submission id: $SUBMISSION_ID"
+
+          for i in {1..120}; do
+            echo "Checking notarization status. Attempt $i/120..."
+
+            INFO_OUTPUT=$(xcrun notarytool info "$SUBMISSION_ID" \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --output-format json)
+
+            echo "$INFO_OUTPUT"
+
+            STATUS=$(echo "$INFO_OUTPUT" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+
+            echo "Current notarization status: $STATUS"
+
+            if [ "$STATUS" = "Accepted" ]; then
+              echo "Notarization accepted."
+              exit 0
+            fi
+
+            if [ "$STATUS" = "Invalid" ] || [ "$STATUS" = "Rejected" ]; then
+              echo "Notarization failed. Fetching log..."
+
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID" \
+                --team-id "$APPLE_TEAM_ID" \
+                --password "$APPLE_APP_SPECIFIC_PASSWORD"
+
+              exit 1
+            fi
+
+            sleep 30
+          done
+
+          echo "Notarization did not complete within 60 minutes."
+          echo "Fetching latest notarization info..."
+
+          xcrun notarytool info "$SUBMISSION_ID" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD"
+
+          echo "Trying to fetch notarization log, if available..."
+
+          xcrun notarytool log "$SUBMISSION_ID" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" || true
+
+          exit 1
 
       - name: Staple notarization ticket
         run: |
@@ -222,6 +308,8 @@ jobs:
           rm -f "${{ matrix.asset_name }}"
           ditto -c -k --keepParent Socle.app "${{ matrix.asset_name }}"
 
+          echo "Final signed ZIP:"
+          ls -lh "${{ matrix.asset_name }}"
           shasum -a 256 "${{ matrix.asset_name }}"
 
       - name: Upload signed ZIP to GitHub Release
