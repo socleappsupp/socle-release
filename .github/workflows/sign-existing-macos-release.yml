@@ -25,13 +25,16 @@ jobs:
             asset_name: Socle-macos-x64.zip
 
     steps:
+      - name: Checkout release repository
+        uses: actions/checkout@v4
+
       - name: Import Apple Developer ID certificate
         env:
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD: temporary-build-keychain-password
         run: |
-          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > developer_id_application.p12
+          printf "%s" "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > developer_id_application.p12
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
           security default-keychain -s build.keychain
@@ -58,6 +61,7 @@ jobs:
         run: |
           mkdir -p input
           gh release download "${{ github.event.inputs.tag }}" \
+            --repo "${{ github.repository }}" \
             --pattern "${{ matrix.asset_name }}" \
             --dir input
 
@@ -75,7 +79,6 @@ jobs:
           mkdir -p Socle.app/Contents/MacOS
           mkdir -p Socle.app/Contents/Resources
 
-          # Pokud ZIP už obsahuje Socle.app, použijeme ho.
           EXISTING_APP=$(find extracted -maxdepth 3 -name "Socle.app" -type d | head -n 1 || true)
 
           if [ -n "$EXISTING_APP" ]; then
@@ -84,7 +87,6 @@ jobs:
           else
             echo "No Socle.app found. Creating app bundle from raw publish folder."
 
-            # Najdeme složku, kde leží hlavní executable Socle.
             SOCLE_EXEC=$(find extracted -type f -name "Socle" | head -n 1 || true)
 
             if [ -z "$SOCLE_EXEC" ]; then
@@ -163,7 +165,6 @@ jobs:
 
           echo "Using signing identity: $SIGN_IDENTITY"
 
-          # Podepíšeme podepsatelné Mach-O soubory uvnitř app bundle.
           while IFS= read -r -d '' file; do
             if file "$file" | grep -q "Mach-O"; then
               echo "Signing Mach-O file: $file"
@@ -177,7 +178,6 @@ jobs:
             fi
           done < <(find Socle.app/Contents/MacOS -type f -print0)
 
-          # Podepíšeme celý app bundle.
           codesign \
             --force \
             --deep \
@@ -223,4 +223,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "${{ github.event.inputs.tag }}" "${{ matrix.asset_name }}" --clobber
+          gh release upload "${{ github.event.inputs.tag }}" "${{ matrix.asset_name }}" \
+            --repo "${{ github.repository }}" \
+            --clobber
