@@ -190,9 +190,10 @@ jobs:
 
           echo "Using signing identity: $SIGN_IDENTITY"
 
-          while IFS= read -r -d '' file; do
+          echo "Signing dynamic libraries first..."
+          find Socle.app/Contents/MacOS -type f -name "*.dylib" -print0 | while IFS= read -r -d '' file; do
             if file "$file" | grep -q "Mach-O"; then
-              echo "Signing Mach-O file: $file"
+              echo "Signing dylib: $file"
               codesign \
                 --force \
                 --timestamp \
@@ -201,8 +202,23 @@ jobs:
                 --sign "$SIGN_IDENTITY" \
                 "$file"
             fi
-          done < <(find Socle.app/Contents/MacOS -type f -print0)
+          done
 
+          echo "Signing executable Mach-O files..."
+          find Socle.app/Contents/MacOS -type f ! -name "*.dylib" -print0 | while IFS= read -r -d '' file; do
+            if file "$file" | grep -q "Mach-O"; then
+              echo "Signing executable: $file"
+              codesign \
+                --force \
+                --timestamp \
+                --options runtime \
+                --entitlements entitlements.plist \
+                --sign "$SIGN_IDENTITY" \
+                "$file"
+            fi
+          done
+
+          echo "Signing app bundle..."
           codesign \
             --force \
             --timestamp \
@@ -212,7 +228,6 @@ jobs:
             Socle.app
 
           codesign --verify --deep --strict --verbose=2 Socle.app
-
       - name: Create ZIP for notarization
         run: |
           rm -f "notarization-${{ matrix.asset_name }}"
