@@ -34,6 +34,8 @@ jobs:
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD: temporary-build-keychain-password
         run: |
+          set -euo pipefail
+
           printf "%s" "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > developer_id_application.p12
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
@@ -59,6 +61,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+
           mkdir -p input
 
           gh release download "${{ github.event.inputs.tag }}" \
@@ -71,6 +75,8 @@ jobs:
 
       - name: Extract release asset
         run: |
+          set -euo pipefail
+
           rm -rf extracted
           mkdir -p extracted
 
@@ -81,6 +87,8 @@ jobs:
 
       - name: Build Socle.app bundle from extracted binaries
         run: |
+          set -euo pipefail
+
           rm -rf Socle.app
           mkdir -p Socle.app/Contents/MacOS
           mkdir -p Socle.app/Contents/Resources
@@ -89,6 +97,8 @@ jobs:
 
           if [ -n "$EXISTING_APP" ]; then
             echo "Existing Socle.app found: $EXISTING_APP"
+
+            rm -rf Socle.app
             cp -R "$EXISTING_APP" ./Socle.app
           else
             echo "No Socle.app found. Creating app bundle from raw publish folder."
@@ -162,6 +172,8 @@ jobs:
 
       - name: Create entitlements
         run: |
+          set -euo pipefail
+
           cat > entitlements.plist <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -180,6 +192,8 @@ jobs:
 
       - name: Sign Socle.app
         run: |
+          set -euo pipefail
+
           SIGN_IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -n 1 | sed -E 's/.*"(.+)"/\1/')
 
           if [ -z "$SIGN_IDENTITY" ]; then
@@ -228,8 +242,11 @@ jobs:
             Socle.app
 
           codesign --verify --deep --strict --verbose=2 Socle.app
+
       - name: Create ZIP for notarization
         run: |
+          set -euo pipefail
+
           rm -f "notarization-${{ matrix.asset_name }}"
           ditto -c -k --keepParent Socle.app "notarization-${{ matrix.asset_name }}"
 
@@ -238,6 +255,7 @@ jobs:
           shasum -a 256 "notarization-${{ matrix.asset_name }}"
 
       - name: Notarize ZIP
+        id: notarize
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -246,8 +264,15 @@ jobs:
           set -euo pipefail
 
           ZIP_PATH="notarization-${{ matrix.asset_name }}"
+          STATUS_FILE="notarization-status-${{ matrix.rid }}.json"
+          LOG_FILE="notarization-log-${{ matrix.rid }}.txt"
+
+          MAX_ATTEMPTS=360
+          SLEEP_SECONDS=30
+          TIMEOUT_MINUTES=$((MAX_ATTEMPTS * SLEEP_SECONDS / 60))
 
           echo "Submitting notarization request for $ZIP_PATH"
+          echo "Timeout: $TIMEOUT_MINUTES minutes"
 
           SUBMISSION_OUTPUT=$(xcrun notarytool submit "$ZIP_PATH" \
             --apple-id "$APPLE_ID" \
@@ -255,14 +280,22 @@ jobs:
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --output-format json)
 
-          echo "$SUBMISSION_OUTPUT"
+          echo "$SUBMISSION_OUTPUT" | tee "$STATUS_FILE"
 
           SUBMISSION_ID=$(echo "$SUBMISSION_OUTPUT" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 
           echo "Notarization submission id: $SUBMISSION_ID"
 
-          for i in {1..120}; do
-            echo "Checking notarization status. Attempt $i/120..."
+          {
+            echo "submission_id=$SUBMISSION_ID"
+            echo "status=Submitted"
+            echo "accepted=false"
+          } >> "$GITHUB_OUTPUT"
+
+          FINAL_STATUS="Submitted"
+
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            echo "Checking notarization status. Attempt $i/$MAX_ATTEMPTS..."
 
             INFO_OUTPUT=$(xcrun notarytool info "$SUBMISSION_ID" \
               --apple-id "$APPLE_ID" \
@@ -270,56 +303,124 @@ jobs:
               --password "$APPLE_APP_SPECIFIC_PASSWORD" \
               --output-format json)
 
-            echo "$INFO_OUTPUT"
+            echo "$INFO_OUTPUT" | tee "$STATUS_FILE"
 
             STATUS=$(echo "$INFO_OUTPUT" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+            FINAL_STATUS="$STATUS"
 
             echo "Current notarization status: $STATUS"
 
             if [ "$STATUS" = "Accepted" ]; then
               echo "Notarization accepted."
+
+              {
+                echo "submission_id=$SUBMISSION_ID"
+                echo "status=Accepted"
+                echo "accepted=true"
+              } >> "$GITHUB_OUTPUT"
+
+              {
+                echo "## Notarization accepted"
+                echo ""
+                echo "- RID: \`${{ matrix.rid }}\`"
+                echo "- Asset: \`${{ matrix.asset_name }}\`"
+                echo "- Submission ID: \`$SUBMISSION_ID\`"
+                echo "- Timeout limit: \`$TIMEOUT_MINUTES minutes\`"
+              } >> "$GITHUB_STEP_SUMMARY"
+
               exit 0
             fi
 
             if [ "$STATUS" = "Invalid" ] || [ "$STATUS" = "Rejected" ]; then
-              echo "Notarization failed. Fetching log..."
+              echo "Notarization failed with status: $STATUS"
+              echo "Fetching notarization log..."
 
               xcrun notarytool log "$SUBMISSION_ID" \
                 --apple-id "$APPLE_ID" \
                 --team-id "$APPLE_TEAM_ID" \
-                --password "$APPLE_APP_SPECIFIC_PASSWORD"
+                --password "$APPLE_APP_SPECIFIC_PASSWORD" | tee "$LOG_FILE"
+
+              {
+                echo "## Notarization failed"
+                echo ""
+                echo "- RID: \`${{ matrix.rid }}\`"
+                echo "- Asset: \`${{ matrix.asset_name }}\`"
+                echo "- Submission ID: \`$SUBMISSION_ID\`"
+                echo "- Status: \`$STATUS\`"
+                echo ""
+                echo "The notarization log was saved as \`$LOG_FILE\`."
+              } >> "$GITHUB_STEP_SUMMARY"
 
               exit 1
             fi
 
-            sleep 30
+            sleep "$SLEEP_SECONDS"
           done
 
-          echo "Notarization did not complete within 60 minutes."
+          echo "Notarization did not complete within $TIMEOUT_MINUTES minutes."
+          echo "Final known status: $FINAL_STATUS"
+          echo "Submission ID: $SUBMISSION_ID"
+          echo "This is treated as pending Apple notarization, not as package validation failure."
+
           echo "Fetching latest notarization info..."
 
           xcrun notarytool info "$SUBMISSION_ID" \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD"
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --output-format json | tee "$STATUS_FILE" || true
 
           echo "Trying to fetch notarization log, if available..."
 
           xcrun notarytool log "$SUBMISSION_ID" \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" || true
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" | tee "$LOG_FILE" || true
 
-          exit 1
+          {
+            echo "submission_id=$SUBMISSION_ID"
+            echo "status=$FINAL_STATUS"
+            echo "accepted=false"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Notarization still pending"
+            echo ""
+            echo "- RID: \`${{ matrix.rid }}\`"
+            echo "- Asset: \`${{ matrix.asset_name }}\`"
+            echo "- Submission ID: \`$SUBMISSION_ID\`"
+            echo "- Final known status: \`$FINAL_STATUS\`"
+            echo "- Timeout limit: \`$TIMEOUT_MINUTES minutes\`"
+            echo ""
+            echo "The final release asset was not overwritten because notarization was not accepted yet."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit 0
+
+      - name: Upload notarization diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: notarization-diagnostics-${{ matrix.rid }}
+          path: |
+            notarization-status-${{ matrix.rid }}.json
+            notarization-log-${{ matrix.rid }}.txt
+          if-no-files-found: ignore
 
       - name: Staple notarization ticket
+        if: steps.notarize.outputs.accepted == 'true'
         run: |
+          set -euo pipefail
+
           xcrun stapler staple Socle.app
           xcrun stapler validate Socle.app
           spctl --assess --type execute --verbose Socle.app
 
       - name: Create final signed ZIP
+        if: steps.notarize.outputs.accepted == 'true'
         run: |
+          set -euo pipefail
+
           rm -f "${{ matrix.asset_name }}"
           ditto -c -k --keepParent Socle.app "${{ matrix.asset_name }}"
 
@@ -328,9 +429,22 @@ jobs:
           shasum -a 256 "${{ matrix.asset_name }}"
 
       - name: Upload signed ZIP to GitHub Release
+        if: steps.notarize.outputs.accepted == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+
           gh release upload "${{ github.event.inputs.tag }}" "${{ matrix.asset_name }}" \
             --repo "${{ github.repository }}" \
             --clobber
+
+      - name: Report pending notarization
+        if: steps.notarize.outputs.accepted != 'true'
+        run: |
+          set -euo pipefail
+
+          echo "Notarization was not accepted during this run."
+          echo "Status: ${{ steps.notarize.outputs.status }}"
+          echo "Submission ID: ${{ steps.notarize.outputs.submission_id }}"
+          echo "Final release asset was not overwritten."
