@@ -7,9 +7,15 @@ on:
         description: "Existing release tag, for example v2.0.20"
         required: true
         type: string
+      cleanup_temp_assets:
+        description: "Delete .temp release assets after final assets are published"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   sign-existing-macos-assets:
@@ -21,8 +27,10 @@ jobs:
         include:
           - rid: macos-arm64
             asset_name: Socle-macos-arm64.zip
+            temp_asset_name: Socle-macos-arm64.zip.temp
           - rid: macos-x64
             asset_name: Socle-macos-x64.zip
+            temp_asset_name: Socle-macos-x64.zip.temp
 
     steps:
       - name: Checkout release repository
@@ -67,7 +75,7 @@ jobs:
 
           gh release download "${{ github.event.inputs.tag }}" \
             --repo "${{ github.repository }}" \
-            --pattern "${{ matrix.asset_name }}" \
+            --pattern "${{ matrix.temp_asset_name }}" \
             --dir input
 
           echo "Downloaded input files:"
@@ -80,7 +88,7 @@ jobs:
           rm -rf extracted
           mkdir -p extracted
 
-          unzip -q "input/${{ matrix.asset_name }}" -d extracted
+          unzip -q "input/${{ matrix.temp_asset_name }}" -d extracted
 
           echo "Extracted files:"
           find extracted -maxdepth 5 -type f | sort | head -200
@@ -428,16 +436,13 @@ jobs:
           ls -lh "${{ matrix.asset_name }}"
           shasum -a 256 "${{ matrix.asset_name }}"
 
-      - name: Upload signed ZIP to GitHub Release
+      - name: Upload signed ZIP as workflow artifact
         if: steps.notarize.outputs.accepted == 'true'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          gh release upload "${{ github.event.inputs.tag }}" "${{ matrix.asset_name }}" \
-            --repo "${{ github.repository }}" \
-            --clobber
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-zip-${{ matrix.rid }}
+          path: ${{ matrix.asset_name }}
+          if-no-files-found: error
 
       - name: Report pending notarization
         if: steps.notarize.outputs.accepted != 'true'
@@ -447,4 +452,159 @@ jobs:
           echo "Notarization was not accepted during this run."
           echo "Status: ${{ steps.notarize.outputs.status }}"
           echo "Submission ID: ${{ steps.notarize.outputs.submission_id }}"
-          echo "Final release asset was not overwritten."
+          echo "Final release assets were not published."
+          exit 1
+
+  finalize-release-assets:
+    needs: sign-existing-macos-assets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download signed macOS ZIP artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: signed-zip-*
+          path: signed
+          merge-multiple: true
+
+      - name: Download staged release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p staged
+
+          gh release download "${{ github.event.inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "Socle-win-x64.zip.temp" \
+            --dir staged
+
+          gh release download "${{ github.event.inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "socle-update.xml.temp" \
+            --dir staged
+
+          echo "Staged release assets:"
+          ls -la staged
+
+          echo "Signed macOS artifacts:"
+          ls -la signed
+
+      - name: Create final release assets and manifest
+        run: |
+          set -euo pipefail
+
+          mkdir -p final
+
+          python3 <<'PY'
+          import hashlib
+          import pathlib
+          import shutil
+          import xml.etree.ElementTree as ET
+
+          staged = pathlib.Path("staged")
+          signed = pathlib.Path("signed")
+          final = pathlib.Path("final")
+
+          assets = {
+              ("windows", "x64"): {
+                  "source": staged / "Socle-win-x64.zip.temp",
+                  "final_name": "Socle-win-x64.zip",
+              },
+              ("macos", "arm64"): {
+                  "source": signed / "Socle-macos-arm64.zip",
+                  "final_name": "Socle-macos-arm64.zip",
+              },
+              ("macos", "x64"): {
+                  "source": signed / "Socle-macos-x64.zip",
+                  "final_name": "Socle-macos-x64.zip",
+              },
+          }
+
+          for descriptor in assets.values():
+              source = descriptor["source"]
+              if not source.is_file():
+                  raise FileNotFoundError(f"Missing required asset: {source}")
+              shutil.copyfile(source, final / descriptor["final_name"])
+
+          manifest_path = staged / "socle-update.xml.temp"
+          if not manifest_path.is_file():
+              raise FileNotFoundError(f"Missing staged update manifest: {manifest_path}")
+
+          tree = ET.parse(manifest_path)
+          root = tree.getroot()
+          packages = root.find("./app/packages")
+          if packages is None:
+              raise ValueError("Update manifest does not contain app/packages.")
+
+          seen = set()
+          for package in packages.findall("package"):
+              platform = (package.findtext("platform") or "").strip()
+              architecture = (package.findtext("architecture") or "").strip()
+              key = (platform, architecture)
+              descriptor = assets.get(key)
+              if descriptor is None:
+                  continue
+
+              final_path = final / descriptor["final_name"]
+              data = final_path.read_bytes()
+              digest = hashlib.sha256(data).hexdigest().upper()
+
+              package.find("fileName").text = descriptor["final_name"]
+              hash_node = package.find("hash")
+              if hash_node is None:
+                  hash_node = ET.SubElement(package, "hash")
+              hash_node.set("algorithm", "SHA256")
+              hash_node.text = digest
+
+              size_node = package.find("size")
+              if size_node is None:
+                  size_node = ET.SubElement(package, "size")
+              size_node.text = str(len(data))
+
+              seen.add(key)
+
+          missing = set(assets.keys()) - seen
+          if missing:
+              raise ValueError(f"Update manifest is missing package entries for: {sorted(missing)}")
+
+          ET.indent(tree, space="  ")
+          tree.write(final / "socle-update.xml", encoding="utf-8", xml_declaration=True)
+          PY
+
+          echo "Final release assets:"
+          ls -lh final
+          sha256sum final/*
+
+      - name: Upload final assets to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          gh release upload "${{ github.event.inputs.tag }}" \
+            final/Socle-win-x64.zip \
+            final/Socle-macos-arm64.zip \
+            final/Socle-macos-x64.zip \
+            final/socle-update.xml \
+            --repo "${{ github.repository }}" \
+            --clobber
+
+      - name: Delete staged temp assets
+        if: github.event.inputs.cleanup_temp_assets == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          for asset in \
+            "Socle-win-x64.zip.temp" \
+            "Socle-macos-arm64.zip.temp" \
+            "Socle-macos-x64.zip.temp" \
+            "socle-update.xml.temp"
+          do
+            gh release delete-asset "${{ github.event.inputs.tag }}" "$asset" \
+              --repo "${{ github.repository }}" \
+              -y || true
+          done
