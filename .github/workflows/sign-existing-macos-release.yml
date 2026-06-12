@@ -10,7 +10,7 @@ on:
       cleanup_temp_assets:
         description: "Delete .temp release assets after final assets are published"
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
@@ -88,7 +88,7 @@ jobs:
           rm -rf extracted
           mkdir -p extracted
 
-          unzip -q "input/${{ matrix.temp_asset_name }}" -d extracted
+          ditto -x -k "input/${{ matrix.temp_asset_name }}" extracted
 
           echo "Extracted files:"
           find extracted -maxdepth 5 -type f | sort | head -200
@@ -133,7 +133,22 @@ jobs:
             exit 1
           fi
 
-          chmod +x Socle.app/Contents/MacOS/Socle
+          if [ ! -f "Socle.app/Contents/MacOS/Socle-updater" ]; then
+            echo "Socle-updater executable was not found in Socle.app/Contents/MacOS."
+            echo "Current app bundle files:"
+            find Socle.app -maxdepth 6 -type f | sort
+            exit 1
+          fi
+
+          chmod 755 Socle.app/Contents/MacOS/Socle
+          chmod 755 Socle.app/Contents/MacOS/Socle-updater
+
+          find Socle.app/Contents/MacOS -type f \( \
+            -name "*.dylib" -o \
+            -name "*.sh" \
+          \) -print0 | while IFS= read -r -d '' file; do
+            chmod 755 "$file"
+          done
 
           find Socle.app/Contents/MacOS -maxdepth 1 -type f \( \
             -iname "README.txt" -o \
@@ -177,6 +192,10 @@ jobs:
 
           echo "Created app bundle:"
           find Socle.app -maxdepth 5 -type f | sort | head -200
+          echo "Executable payload:"
+          ls -l Socle.app/Contents/MacOS/Socle Socle.app/Contents/MacOS/Socle-updater
+          test -x Socle.app/Contents/MacOS/Socle
+          test -x Socle.app/Contents/MacOS/Socle-updater
 
       - name: Create entitlements
         run: |
@@ -592,7 +611,7 @@ jobs:
             --clobber
 
       - name: Delete staged temp assets
-        if: github.event.inputs.cleanup_temp_assets == 'true'
+        if: success() && github.event.inputs.cleanup_temp_assets == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
