@@ -197,6 +197,55 @@ jobs:
           test -x Socle.app/Contents/MacOS/Socle
           test -x Socle.app/Contents/MacOS/Socle-updater
 
+      - name: Place Copilot runtime resources outside MacOS
+        run: |
+          set -euo pipefail
+
+          # Code signing treats files in Contents/MacOS as code. The Copilot
+          # runtime also contains JavaScript, JSON and Markdown resources.
+          # Keep their expected paths as links to the bundle's Resources.
+          /usr/bin/python3 <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+
+          contents = Path("Socle.app/Contents")
+          macos = contents / "MacOS"
+          resources = contents / "Resources"
+          frameworks = contents / "Frameworks"
+          runtime = macos / "runtimes"
+
+          if not runtime.is_dir():
+              print("No Copilot runtime directory; nothing to relocate.")
+          else:
+              for app in sorted(runtime.rglob("*.app")):
+                  if not app.is_dir() or app.is_symlink():
+                      continue
+                  destination = frameworks / app.name
+                  if destination.exists():
+                      raise RuntimeError(f"Duplicate embedded app: {destination}")
+                  frameworks.mkdir(parents=True, exist_ok=True)
+                  shutil.move(str(app), str(destination))
+                  app.symlink_to(os.path.relpath(destination, app.parent), target_is_directory=True)
+                  print(f"Moved nested app to {destination}")
+
+              moved = 0
+              for source in runtime.rglob("*"):
+                  if not source.is_file() or source.is_symlink():
+                      continue
+                  kind = subprocess.check_output(["file", "-b", str(source)], text=True)
+                  if "Mach-O" in kind:
+                      continue
+                  destination = resources / source.relative_to(macos)
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.move(str(source), str(destination))
+                  source.symlink_to(os.path.relpath(destination, source.parent))
+                  moved += 1
+
+              print(f"Moved {moved} Copilot runtime resource files to {resources}")
+          PY
+
       - name: Create entitlements
         run: |
           set -euo pipefail
@@ -245,8 +294,22 @@ jobs:
             fi
           done
 
+          echo "Signing nested app bundles..."
+          if [ -d Socle.app/Contents/Frameworks ]; then
+            find Socle.app/Contents/Frameworks -type d -name "*.app" -print0 | while IFS= read -r -d '' app; do
+              echo "Signing nested app: $app"
+              codesign \
+                --force \
+                --timestamp \
+                --options runtime \
+                --entitlements entitlements.plist \
+                --sign "$SIGN_IDENTITY" \
+                "$app"
+            done
+          fi
+
           echo "Signing executable Mach-O files..."
-          find Socle.app/Contents/MacOS -type f ! -name "*.dylib" -print0 | while IFS= read -r -d '' file; do
+          find Socle.app/Contents/MacOS -type f ! -name "*.dylib" ! -name "Socle" -print0 | while IFS= read -r -d '' file; do
             if file "$file" | grep -q "Mach-O"; then
               echo "Signing executable: $file"
               codesign \
