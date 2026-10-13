@@ -41,6 +41,24 @@ Platform-specific quick-start notes are available in `README.txt` inside the rel
 
 Socle includes an update workflow based on the published release manifest and bundled updater.
 
+## macOS release workflow maintenance
+
+The signing workflow normalizes the complete app payload before signing. All
+non-Mach-O files in `Contents/MacOS`, including icons, third-party licenses,
+managed DLLs and Copilot resources, move to `Contents/Resources`. Relative
+symlinks preserve their original paths. Licenses are retained. Embedded apps
+move to `Contents/Frameworks`, keeping any inner bundles intact.
+
+Native libraries and helper binaries are signed before enclosing app bundles,
+from the deepest bundle outward. The outer Socle app is signed last and verified
+before notarization. The workflow can reprocess existing `.zip.temp` assets;
+changing this layout step does not require a new application build.
+
+Run the layout regression tests with `python3 tests/test_macos_bundle_layout.py`
+and `file` available on PATH. These exercise the actual workflow script,
+including the Octicons license, runtime preloads, nested apps and destination
+conflicts. Actual Developer ID signing and notarization run on GitHub macOS.
+
 ## Support
 
 Public release information:
