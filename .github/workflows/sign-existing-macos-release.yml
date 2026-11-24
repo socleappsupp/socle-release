@@ -531,7 +531,9 @@ jobs:
           shasum -a 256 "${{ matrix.asset_name }}"
 
       - name: Upload signed ZIP as workflow artifact
+        id: upload_signed
         if: steps.notarize.outputs.accepted == 'true'
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: signed-zip-${{ matrix.rid }}
@@ -539,6 +541,47 @@ jobs:
             ${{ matrix.asset_name }}
             Socle-Setup-${{ matrix.rid }}.dmg
           if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+      # Retry the transfer on the same runner: signing, notarization and DMG
+      # creation must not be repeated for a transient artifact-service failure.
+      - name: Wait before second artifact upload
+        if: ${{ !cancelled() && steps.upload_signed.outcome == 'failure' }}
+        run: sleep 20
+
+      - name: Retry signed artifact upload (2/3)
+        id: upload_signed_retry
+        if: ${{ !cancelled() && steps.upload_signed.outcome == 'failure' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-zip-${{ matrix.rid }}
+          path: |
+            ${{ matrix.asset_name }}
+            Socle-Setup-${{ matrix.rid }}.dmg
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+      - name: Wait before final artifact upload
+        if: ${{ !cancelled() && steps.upload_signed_retry.outcome == 'failure' }}
+        run: sleep 40
+
+      # The final attempt is deliberately fatal so promotion cannot proceed
+      # without both signed ZIP and DMG artifacts.
+      - name: Retry signed artifact upload (3/3)
+        id: upload_signed_final
+        if: ${{ !cancelled() && steps.upload_signed_retry.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-zip-${{ matrix.rid }}
+          path: |
+            ${{ matrix.asset_name }}
+            Socle-Setup-${{ matrix.rid }}.dmg
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
 
       - name: Report pending notarization
         if: steps.notarize.outputs.accepted != 'true'
