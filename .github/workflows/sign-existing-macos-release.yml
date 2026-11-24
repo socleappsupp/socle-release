@@ -508,6 +508,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # These job-local copies are no longer needed after stapling Socle.app.
+          rm -rf -- input extracted
+          rm -f -- "notarization-${{ matrix.asset_name }}"
+          echo "Host disk space before DMG creation:"
+          df -h . "${TMPDIR:-/tmp}"
+          du -sh Socle.app
           gh release download "${{ github.event.inputs.tag }}" --repo "${{ github.repository }}" --pattern "Socle-installer-tools.zip.temp" --dir installer-tools
           unzip -q installer-tools/Socle-installer-tools.zip.temp -d installer-tools/source
           bash installer-tools/source/macos/new-dmg.sh Socle.app "Socle-Setup-${{ matrix.rid }}.dmg"
@@ -732,4 +738,4 @@ jobs:
             [ -f "$staged" ] || continue
             gh release delete-asset "${{ github.event.inputs.tag }}" "$(basename "$staged")" --repo "${{ github.repository }}" -y
           done
- 
+
