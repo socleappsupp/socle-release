@@ -502,6 +502,16 @@ jobs:
           xcrun stapler validate Socle.app
           spctl --assess --type execute --verbose Socle.app
 
+      - name: Create macOS installer from accepted app
+        if: steps.notarize.outputs.accepted == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download "${{ github.event.inputs.tag }}" --repo "${{ github.repository }}" --pattern "Socle-installer-tools.zip.temp" --dir installer-tools
+          unzip -q installer-tools/Socle-installer-tools.zip.temp -d installer-tools/source
+          bash installer-tools/source/macos/new-dmg.sh Socle.app "Socle-Setup-${{ matrix.rid }}.dmg"
+
       - name: Create final signed ZIP
         if: steps.notarize.outputs.accepted == 'true'
         run: |
@@ -519,7 +529,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: signed-zip-${{ matrix.rid }}
-          path: ${{ matrix.asset_name }}
+          path: |
+            ${{ matrix.asset_name }}
+            Socle-Setup-${{ matrix.rid }}.dmg
           if-no-files-found: error
 
       - name: Report pending notarization
@@ -563,6 +575,15 @@ jobs:
             --pattern "socle-update.xml.temp" \
             --dir staged
 
+          gh release download "${{ github.event.inputs.tag }}" --repo "${{ github.repository }}" --pattern "Socle-Setup.exe.temp" --pattern "Socle-Offline-Setup-win-x64.exe.temp" --dir staged
+          gh release download "${{ github.event.inputs.tag }}" --repo "${{ github.repository }}" --pattern "README.md" --dir staged
+          VERSION=$(python3 -c 'import xml.etree.ElementTree as E; print(E.parse("staged/socle-update.xml.temp").findtext("./app/version"))')
+          for ARCH in x64 arm64; do
+            if python3 -c 'import sys,xml.etree.ElementTree as E; sys.exit(not any(p.findtext("platform")=="linux" and p.findtext("architecture")==sys.argv[1] for p in E.parse("staged/socle-update.xml.temp").findall("./app/packages/package")))' "$ARCH"; then
+              gh release download "${{ github.event.inputs.tag }}" --repo "${{ github.repository }}" --pattern "Socle-linux-$ARCH.zip.temp" --pattern "Socle-Setup-linux-$ARCH.run.temp" --pattern "Socle-Offline-Setup-linux-$ARCH.run.temp" --dir staged
+            fi
+          done
+
           echo "Staged release assets:"
           ls -la staged
 
@@ -599,6 +620,11 @@ jobs:
                   "final_name": "Socle-macos-x64.zip",
               },
           }
+
+          for architecture in ("x64", "arm64"):
+              source = staged / f"Socle-linux-{architecture}.zip.temp"
+              if source.is_file():
+                  assets[("linux", architecture)] = {"source": source, "final_name": f"Socle-linux-{architecture}.zip"}
 
           for descriptor in assets.values():
               source = descriptor["source"]
@@ -647,8 +673,26 @@ jobs:
           if missing:
               raise ValueError(f"Update manifest is missing package entries for: {sorted(missing)}")
 
+          version = root.findtext("./app/version")
+          required_installers = [staged / "Socle-Setup.exe.temp", staged / "Socle-Offline-Setup-win-x64.exe.temp"]
+          required_installers += [signed / f"Socle-Setup-macos-{arch}.dmg" for arch in ("arm64", "x64")]
+          required_installers += [staged / f"Socle-{prefix}Setup-linux-{arch}.run.temp" for platform, arch in assets if platform == "linux" for prefix in ("", "Offline-")]
+          for source in required_installers:
+              if not source.is_file():
+                  raise FileNotFoundError(f"Missing installer: {source}")
+              shutil.copyfile(source, final / source.name.removesuffix(".temp"))
+          if any((p.findtext("fileName") or "").endswith(".temp") for p in packages):
+              raise ValueError("Refusing to publish a manifest that still references staging assets.")
           ET.indent(tree, space="  ")
           tree.write(final / "socle-update.xml", encoding="utf-8", xml_declaration=True)
+          notes = (staged / "README.md").read_text(encoding="utf-8")
+          if f"Version: **{version}**" not in notes:
+              raise ValueError("Distribution README version does not match the manifest.")
+          changes = notes.split("## Changes in", 1)[1].split("## Packages", 1)[0]
+          readme = [f"# Socle {version}", "", f"Release date: {root.findtext('./app/releaseDate')}", "", "## Changes in" + changes, "## Packages", "", "Online Setup downloads the latest final ZIP. Offline Setup and ZIP packages contain Socle and Socle-updater together.", "", "| File | Bytes | SHA-256 |", "| --- | ---: | --- |"]
+          for item in sorted(final.iterdir()):
+              readme.append(f"| {item.name} | {item.stat().st_size} | {hashlib.sha256(item.read_bytes()).hexdigest().upper()} |")
+          (final / "README.md").write_text("\n".join(readme) + "\n", encoding="utf-8")
           PY
 
           echo "Final release assets:"
@@ -662,10 +706,7 @@ jobs:
           set -euo pipefail
 
           gh release upload "${{ github.event.inputs.tag }}" \
-            final/Socle-win-x64.zip \
-            final/Socle-macos-arm64.zip \
-            final/Socle-macos-x64.zip \
-            final/socle-update.xml \
+            final/* \
             --repo "${{ github.repository }}" \
             --clobber
 
@@ -680,9 +721,15 @@ jobs:
             "Socle-win-x64.zip.temp" \
             "Socle-macos-arm64.zip.temp" \
             "Socle-macos-x64.zip.temp" \
+            "Socle-installer-tools.zip.temp" \
             "socle-update.xml.temp"
           do
             gh release delete-asset "${{ github.event.inputs.tag }}" "$asset" \
               --repo "${{ github.repository }}" \
               -y || true
           done
+          for staged in staged/Socle-Setup*.temp staged/Socle-Offline-Setup*.temp staged/Socle-linux-*.zip.temp; do
+            [ -f "$staged" ] || continue
+            gh release delete-asset "${{ github.event.inputs.tag }}" "$(basename "$staged")" --repo "${{ github.repository }}" -y
+          done
+ 
